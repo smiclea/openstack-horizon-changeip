@@ -1,5 +1,5 @@
 diff --git a/horizon/static/horizon/js/horizon.forms.js b/horizon/static/horizon/js/horizon.forms.js
-index 9be8877..c92c2f0 100644
+index 276b766..16245ff 100644
 --- a/horizon/static/horizon/js/horizon.forms.js
 +++ b/horizon/static/horizon/js/horizon.forms.js
 @@ -14,6 +14,56 @@
@@ -59,7 +59,7 @@ index 9be8877..c92c2f0 100644
    handle_snapshot_source: function() {
      $("div.table_wrapper, #modal_wrapper").on("change", "select#id_snapshot_source", function() {
        var $option = $(this).find("option:selected");
-@@ -471,6 +521,7 @@ horizon.addInitFunction(horizon.forms.init = function () {
+@@ -474,6 +524,7 @@ horizon.addInitFunction(horizon.forms.init = function () {
    horizon.forms.datepicker();
    horizon.forms.handle_subnet_address_source();
    horizon.forms.handle_subnet_subnetpool();
@@ -109,11 +109,27 @@ index 2773446..9bcf717 100644
  @profiler.trace
  def server_get(request, instance_id):
      return Server(get_novaclient_with_instance_desc(request).servers.get(
+diff --git a/openstack_dashboard/api/neutron.py b/openstack_dashboard/api/neutron.py
+index cbec3e2..5b1d60b 100644
+--- a/openstack_dashboard/api/neutron.py
++++ b/openstack_dashboard/api/neutron.py
+@@ -1577,6 +1577,11 @@ def show_network_ip_availability(request, network_id):
+     return ip_availability
+ 
+ 
++@profiler.trace
++def list_network_ip_availabilities(request):
++    return neutronclient(request).list_network_ip_availabilities()
++
++
+ @profiler.trace
+ def add_network_to_dhcp_agent(request, dhcp_agent, network_id):
+     body = {'network_id': network_id}
 diff --git a/openstack_dashboard/api/nova.py b/openstack_dashboard/api/nova.py
-index c0cbf40..6375e98 100644
+index fd449c2..6e9de22 100644
 --- a/openstack_dashboard/api/nova.py
 +++ b/openstack_dashboard/api/nova.py
-@@ -188,6 +188,8 @@ class QuotaSet(base.QuotaSet):
+@@ -294,6 +294,8 @@ class QuotaSet(base.QuotaSet):
          "security_group_rules",
      }
  
@@ -123,10 +139,10 @@ index c0cbf40..6375e98 100644
  def upgrade_api(request, client, version):
      """Ugrade the nova API to the specified version if possible."""
 diff --git a/openstack_dashboard/dashboards/project/instances/forms.py b/openstack_dashboard/dashboards/project/instances/forms.py
-index 772b146..c5f1c68 100644
+index 9f9ee85..697a2d2 100644
 --- a/openstack_dashboard/dashboards/project/instances/forms.py
 +++ b/openstack_dashboard/dashboards/project/instances/forms.py
-@@ -127,6 +127,219 @@ class RebuildInstanceForm(forms.SelfHandlingForm):
+@@ -126,6 +126,231 @@ class RebuildInstanceForm(forms.SelfHandlingForm):
          return True
  
  
@@ -173,17 +189,18 @@ index 772b146..c5f1c68 100644
 +        try:
 +            self.ports = api.neutron.port_list(request, device_id=instance_id)
 +            self.networks = api.neutron.network_list(request)
++            self.ip_availabilities = api.neutron.list_network_ip_availabilities(
++                request)
 +        except Exception:
 +            exceptions.handle(request, _('Unable to retrieve ports '
 +                                         'information.'))
 +
 +        selected_ip_choices = []
 +        for port in self.ports:
-+            network = list(
-+                filter(
-+                    lambda network, p=port: network.id == p.network_id,
-+                    self.networks
-+                ))[0]
++            network = next(filter(
++                lambda network, p=port: network.id == p.network_id,
++                self.networks
++            ), None)
 +            for ip in port.fixed_ips:
 +                choice_id = _('%s__split__%s__split__%s') % (
 +                    port.id, port.network_id, ip['ip_address'])
@@ -200,11 +217,22 @@ index 772b146..c5f1c68 100644
 +
 +        selected_subnet_choices = []
 +        for network in self.networks:
++            ip_availability_network = next(filter(
++                lambda n: n['network_id'] == network.id, self.ip_availabilities['network_ip_availabilities']), None)
 +            for subnet in network.subnets:
++                ip_availability_subnet = next(filter(
++                    lambda s: s['subnet_id'] == subnet.id, ip_availability_network['subnet_ip_availability']), None)
 +                subnet_id = _('%s__split__%s') % (network.id, subnet.id)
 +                subnet_name = subnet.name or _('(%s-%s)') % (subnet.id.split(
 +                    '-')[0], subnet.id.split('-')[1])
-+                selected_subnet_choices.append((subnet_id, subnet_name))
++                subnet_name = ('%s (%s free IPs)') % (
++                    subnet_name, ip_availability_subnet['total_ips'] - ip_availability_subnet['used_ips'])
++                selected_subnet_choices.append(
++                    (subnet_id, subnet_name))
++
++        selected_subnet_choices.sort(key=lambda k: k[1])
++        selected_subnet_choices = [(c[0], c[1])
++                                   for c in selected_subnet_choices]
 +        self.fields['selected_subnet'].choices = selected_subnet_choices
 +
 +    def redirect_to_next(self, request, next_param):
