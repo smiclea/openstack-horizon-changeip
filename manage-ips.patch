@@ -1,0 +1,519 @@
+diff --git a/horizon/static/horizon/js/horizon.forms.js b/horizon/static/horizon/js/horizon.forms.js
+index 8fff1d0..ec3ddf8 100644
+--- a/horizon/static/horizon/js/horizon.forms.js
++++ b/horizon/static/horizon/js/horizon.forms.js
+@@ -14,6 +14,56 @@
+ 
+ /* Namespace for core functionality related to Forms. */
+ horizon.forms = {
++  handle_manage_ip: function () {
++    let loaded = false
++
++    $(document).on('DOMNodeInserted', function (e) {
++      if (window.location.href.indexOf('changeip') === -1) {
++        if ($(e.target).attr('id') !== 'changeip_modal') {
++          return
++        }
++      } else if (loaded) {
++        return
++      }
++
++      loaded = true
++
++      const changeIpFormSelector = '#changeip_form'
++      let anyRadioChecked = $(changeIpFormSelector + ' input:radio').is(':checked')
++      if (!anyRadioChecked) {
++        $(changeIpFormSelector + ' input:radio:first').click()
++      }
++
++      let subnetsClone = $("#id_selected_subnet option").clone()
++      const populateSubnetsDropdown = function () {
++        $("#id_selected_subnet option").remove()
++        let selectedNetworkId = $('#id_selected_ip')[0].value.split('__split__')[1]
++        if (!selectedNetworkId) {
++          let clone = $(subnetsClone[0]).clone()
++          clone.text('No Subnets available')
++          $("#id_selected_subnet").append(clone)
++          return
++        }
++        subnetsClone.each(function () {
++          let subnetNetworkId = this.value.split('__split__')[0]
++          if (subnetNetworkId === selectedNetworkId) {
++            $("#id_selected_subnet").append($(this))
++          }
++        })
++      }
++      populateSubnetsDropdown()
++
++      $('#id_selected_ip').on("change", function (e) {
++        populateSubnetsDropdown()
++      })
++
++      $(changeIpFormSelector + ' input:radio').on("change", function (e) {
++        $(changeIpFormSelector + ' #id_fixed_ip').attr('disabled', $(e.target).attr('id') === 'id_actions_2')
++        $(changeIpFormSelector + ' #id_selected_subnet').siblings('button').attr('disabled', $(e.target).attr('id') === 'id_actions_2')
++      });
++    });
++  },
++
+   handle_snapshot_source: function() {
+     $("div.table_wrapper, #modal_wrapper").on("change", "select#id_snapshot_source", function() {
+       var $option = $(this).find("option:selected");
+@@ -474,6 +524,7 @@ horizon.addInitFunction(horizon.forms.init = function () {
+   horizon.forms.datepicker();
+   horizon.forms.handle_subnet_address_source();
+   horizon.forms.handle_subnet_subnetpool();
++  horizon.forms.handle_manage_ip();
+ 
+   if (!horizon.conf.disable_password_reveal) {
+     horizon.forms.add_password_fields_reveal_buttons($body);
+diff --git a/openstack_dashboard/api/_nova.py b/openstack_dashboard/api/_nova.py
+index 4d237cc..b6e51f7 100644
+--- a/openstack_dashboard/api/_nova.py
++++ b/openstack_dashboard/api/_nova.py
+@@ -29,6 +29,10 @@ from openstack_dashboard.api import glance
+ from openstack_dashboard.api import microversions
+ from openstack_dashboard.contrib.developer.profiler import api as profiler
+ 
++from keystoneauth1 import session
++from keystoneauth1 import loading
++from novaguestclient import client as novaguestclient
++
+ 
+ # Supported compute versions
+ VERSIONS = base.APIVersionManager("compute", preferred_version=2)
+@@ -193,6 +197,27 @@ def get_novaclient_with_instance_desc(request):
+     return novaclient(request, version=microversion)
+ 
+ 
++def novanetworkingclient(request, version=None):
++    params = {
++        "token": request.user.token.id,
++        "auth_url": base.url_for(request, 'identity'),
++        "project_name": request.user.project_name,
++        "project_domain_id": request.user.token.project.get('domain_id'),
++    }
++    plugin_name = "v3token"
++    loader = loading.get_plugin_loader(plugin_name)
++    auth = loader.load_from_options(**params)
++
++    remote_addr = request.environ.get('REMOTE_ADDR', '')
++    verify = not settings.OPENSTACK_SSL_NO_VERIFY
++    keystone_session = session.Session(auth=auth,
++                                       original_ip=remote_addr,
++                                       verify=verify)
++
++    c = novaguestclient.Client(session=keystone_session)
++    return c
++
++
+ @profiler.trace
+ def server_get(request, instance_id):
+     return Server(get_novaclient_with_instance_desc(request).servers.get(
+diff --git a/openstack_dashboard/api/neutron.py b/openstack_dashboard/api/neutron.py
+index 6263a5e..f18e936 100644
+--- a/openstack_dashboard/api/neutron.py
++++ b/openstack_dashboard/api/neutron.py
+@@ -1929,6 +1929,11 @@ def show_network_ip_availability(request, network_id):
+     return ip_availability
+ 
+ 
++@profiler.trace
++def list_network_ip_availabilities(request):
++    return neutronclient(request).list_network_ip_availabilities()
++
++
+ @profiler.trace
+ def add_network_to_dhcp_agent(request, dhcp_agent, network_id):
+     body = {'network_id': network_id}
+diff --git a/openstack_dashboard/api/nova.py b/openstack_dashboard/api/nova.py
+index 981b114..fe7c82e 100644
+--- a/openstack_dashboard/api/nova.py
++++ b/openstack_dashboard/api/nova.py
+@@ -184,6 +184,10 @@ class QuotaSet(base.QuotaSet):
+     }
+ 
+ 
++def apply_networking(request, instance_id):
++    return _nova.novanetworkingclient(request).networking.apply_networking(instance_id)
++
++
+ def upgrade_api(request, client, version):
+     """Ugrade the nova API to the specified version if possible."""
+ 
+diff --git a/openstack_dashboard/dashboards/project/instances/forms.py b/openstack_dashboard/dashboards/project/instances/forms.py
+index e45ecdd..b74235d 100644
+--- a/openstack_dashboard/dashboards/project/instances/forms.py
++++ b/openstack_dashboard/dashboards/project/instances/forms.py
+@@ -118,6 +118,231 @@ class RebuildInstanceForm(forms.SelfHandlingForm):
+         return True
+ 
+ 
++class ChangeIPForm(forms.SelfHandlingForm):
++    instance_id = forms.CharField(widget=forms.HiddenInput())
++    next_param = forms.CharField(widget=forms.HiddenInput())
++
++    selected_ip = forms.ThemableChoiceField(
++        label=_("IP Address"),
++        required=False
++    )
++
++    selected_subnet = forms.ThemableChoiceField(
++        label=_("Subnet"),
++        required=False
++    )
++
++    fixed_ip = forms.IPField(
++        label=_("New IP Address"),
++        required=False,
++        version=forms.IPv4 | forms.IPv6,
++        widget=forms.TextInput()
++    )
++
++    actions = forms.ThemableChoiceField(
++        label=_("Action"),
++        widget=forms.RadioSelect(),
++        required=False,
++        choices=[
++            ('change', _("Change Current IP to a New IP Address")),
++            ('add', _("Add a New IP Address")),
++            ('remove', _("Remove the Current IP Address"))
++        ]
++    )
++    ports = []
++    networks = []
++
++    def __init__(self, request, *args, **kwargs):
++        super(ChangeIPForm, self).__init__(request, *args, **kwargs)
++        instance_id = kwargs.get('initial', {}).get('instance_id')
++        self.fields['instance_id'].initial = instance_id
++        self.fields['next_param'].initial = request.GET.get('next')
++
++        try:
++            self.ports = api.neutron.port_list(request, device_id=instance_id)
++            self.networks = api.neutron.network_list(request)
++            self.ip_availabilities = api.neutron.list_network_ip_availabilities(
++                request)
++        except Exception:
++            exceptions.handle(request, _('Unable to retrieve ports '
++                                         'information.'))
++
++        selected_ip_choices = []
++        for port in self.ports:
++            network = next(filter(
++                lambda network, p=port: network.id == p.network_id,
++                self.networks
++            ), None)
++            for ip in port.fixed_ips:
++                choice_id = _('%s__split__%s__split__%s') % (
++                    port.id, port.network_id, ip['ip_address'])
++                selected_ip_choices.append((choice_id, _('%s (%s)') %
++                                            (ip['ip_address'], network.name)))
++            if not port.fixed_ips:
++                port_id = _('(%s-%s)') % (port.id.split('-')
++                                          [0], port.id.split('-')[1])
++                selected_ip_choices.append(
++                    (port.id, _('No IP address %s') % port_id))
++        if not selected_ip_choices:
++            selected_ip_choices.insert(0, ("", _("No Ports available")))
++        self.fields['selected_ip'].choices = selected_ip_choices
++
++        selected_subnet_choices = []
++        for network in self.networks:
++            ip_availability_network = next(filter(
++                lambda n: n['network_id'] == network.id, self.ip_availabilities['network_ip_availabilities']), None)
++            for subnet in network.subnets:
++                ip_availability_subnet = next(filter(
++                    lambda s: s['subnet_id'] == subnet.id, ip_availability_network['subnet_ip_availability']), None)
++                subnet_id = _('%s__split__%s') % (network.id, subnet.id)
++                subnet_name = subnet.name or _('(%s-%s)') % (subnet.id.split(
++                    '-')[0], subnet.id.split('-')[1])
++                subnet_name = ('%s (%s free IPs)') % (
++                    subnet_name, ip_availability_subnet['total_ips'] - ip_availability_subnet['used_ips'])
++                selected_subnet_choices.append(
++                    (subnet_id, subnet_name))
++
++        selected_subnet_choices.sort(key=lambda k: k[1])
++        selected_subnet_choices = [(c[0], c[1])
++                                   for c in selected_subnet_choices]
++        self.fields['selected_subnet'].choices = selected_subnet_choices
++
++    def redirect_to_next(self, request, next_param):
++        if next_param:
++            raise exceptions.Http302(next_param)
++        return True
++
++    def apply_networking(self, request, instance_id,
++                         selected_port_id, selected_port_ips, success_message,
++                         next_param):
++        try:
++            api.nova.apply_networking(request, instance_id)
++            messages.success(request, success_message)
++        except Exception as e:
++            messages.error(request, _("Unable to apply networking. %s") % e)
++            self.reverse_networking(
++                request, selected_port_id, selected_port_ips)
++            return False
++
++        return self.redirect_to_next(request, next_param)
++
++    def reverse_networking(self, request, selected_port_id, fixed_ips):
++        try:
++            api.neutron.port_update(
++                request, selected_port_id, fixed_ips=fixed_ips)
++        except Exception as e:
++            messages.error(request, _("Unable to reverse network data. %s") % e)
++
++    def handle(self, request, data):
++        next_param = data.get('next_param')
++        selected_ip_data = data.get('selected_ip').split('__split__')
++        instance_id = data.get('instance_id')
++        new_ip = data.get('fixed_ip') or None
++        port_id = selected_ip_data[0]
++        subnet_data = data.get('selected_subnet').split('__split__')
++        subnet_id = None
++        if len(subnet_data) > 1:
++            subnet_id = subnet_data[1]
++        selected_ip = None
++        if len(selected_ip_data) > 1:
++            selected_ip = selected_ip_data[2]
++        else:
++            subnet_id = None
++
++        action = data.get('actions')
++
++        selected_port_ips = list(
++            filter(
++                lambda port: port.id == port_id, self.ports
++            ))[0].fixed_ips or []
++        if selected_port_ips:
++            selected_port_ips = list(
++                map(
++                    lambda ip: {
++                        'ip_address': ip['ip_address'],
++                        'subnet_id': ip['subnet_id']
++                    },
++                    selected_port_ips
++                ))
++
++        if action == 'change':
++            new_selected_port_ips = list(
++                filter(
++                    lambda ip: ip['ip_address'] != selected_ip,
++                    selected_port_ips
++                ))
++            if subnet_id:
++                if new_ip:
++                    new_selected_port_ips.append(
++                        {'ip_address': new_ip, 'subnet_id': subnet_id})
++                else:
++                    new_selected_port_ips.append(
++                        {'subnet_id': subnet_id})
++            else:
++                new_selected_port_ips.append({'ip_address': new_ip})
++            try:
++                api.neutron.port_update(
++                    request, port_id, fixed_ips=new_selected_port_ips)
++            except Exception as e:
++                messages.error(request, _("Unable to change port. %s") % e)
++                return False
++
++            return self.apply_networking(
++                request, instance_id, port_id, selected_port_ips,
++                _('IP address succesfully changed %s.') % instance_id,
++                next_param
++            )
++
++        if action == 'add':
++            new_selected_port_ips = list(selected_port_ips)
++            if subnet_id:
++                if new_ip:
++                    new_selected_port_ips.append(
++                        {'ip_address': new_ip, 'subnet_id': subnet_id})
++                else:
++                    new_selected_port_ips.append(
++                        {'subnet_id': subnet_id})
++            else:
++                new_selected_port_ips.append({'ip_address': new_ip})
++            try:
++                api.neutron.port_update(
++                    request, port_id, fixed_ips=new_selected_port_ips)
++            except Exception as e:
++                messages.error(request, _("Unable to add IP address. %s") % e)
++                return False
++
++            return self.apply_networking(
++                request, instance_id, port_id, selected_port_ips,
++                _('IP address succesfully added %s.') % instance_id,
++                next_param
++            )
++
++        if action == 'remove':
++            if not selected_ip:
++                messages.error(request, _("No IP Address selected"))
++                return False
++
++            new_selected_port_ips = list(
++                filter(
++                    lambda ip: ip['ip_address'] != selected_ip,
++                    selected_port_ips
++                ))
++            try:
++                api.neutron.port_update(
++                    request, port_id, fixed_ips=new_selected_port_ips)
++            except Exception as e:
++                messages.error(request, _(
++                    "Unable to remove IP address. %s") % e)
++                return False
++
++            return self.apply_networking(
++                request, instance_id, port_id, selected_port_ips,
++                _('IP address succesfully removed %s.') % instance_id,
++                next_param
++            )
++        return True
++
++
+ class DecryptPasswordInstanceForm(forms.SelfHandlingForm):
+     instance_id = forms.CharField(widget=forms.HiddenInput())
+     _keypair_name_label = _("Key Pair Name")
+diff --git a/openstack_dashboard/dashboards/project/instances/tables.py b/openstack_dashboard/dashboards/project/instances/tables.py
+index 3a0e799..ae553a2 100644
+--- a/openstack_dashboard/dashboards/project/instances/tables.py
++++ b/openstack_dashboard/dashboards/project/instances/tables.py
+@@ -677,6 +677,38 @@ class DecryptInstancePassword(tables.LinkAction):
+                                             keypair_name])
+ 
+ 
++class ChangeIP(tables.LinkAction):
++    name = "changeip"
++    verbose_name = _("Manage IPs")
++    classes = ("btn-changeip", "ajax-modal")
++    url = "horizon:project:instances:changeip"
++
++    def allowed(self, request, instance):
++        if instance.status == 'SHUTOFF':
++            if "disabled" not in self.classes:
++                self.classes = [c for c in self.classes] + ['disabled']
++                self.attrs = {
++                    'title': 'Available only when instance is active',
++                    'style': 'pointer-events: auto'
++                }
++        else:
++            self.classes = [c for c in self.classes if c != "disabled"]
++            self.attrs = {}
++
++        return ((instance.status in ACTIVE_STATES or
++                 instance.status == 'SHUTOFF') and
++                not is_deleting(instance) and
++                api.base.is_service_enabled(request, 'network'))
++
++    def get_link_url(self, datum):
++        instance_id = self.table.get_object_id(datum)
++        base_url = urls.reverse(self.url, args=[instance_id])
++        next_url = self.table.get_full_url()
++        params = {"next": next_url}
++        params = urlencode(params)
++        return "?".join([base_url, params])
++
++
+ class AssociateIP(policy.PolicyTargetMixin, tables.LinkAction):
+     name = "associate"
+     verbose_name = _("Associate Floating IP")
+@@ -1295,7 +1327,7 @@ class InstancesTable(tables.DataTable):
+                                           InstancesFilterAction)
+         row_actions = (StartInstance, ConfirmResize, RevertResize,
+                        CreateSnapshot, AssociateIP, DisassociateIP,
+-                       AttachInterface, DetachInterface, EditInstance,
++                       AttachInterface, DetachInterface, ChangeIP, EditInstance,
+                        AttachVolume, DetachVolume,
+                        UpdateMetadata, DecryptInstancePassword,
+                        EditInstanceSecurityGroups,
+diff --git a/openstack_dashboard/dashboards/project/instances/templates/instances/_changeip.html b/openstack_dashboard/dashboards/project/instances/templates/instances/_changeip.html
+new file mode 100644
+index 0000000..a689cb8
+--- /dev/null
++++ b/openstack_dashboard/dashboards/project/instances/templates/instances/_changeip.html
+@@ -0,0 +1,27 @@
++{% extends "horizon/common/_modal_form.html" %}
++{% load i18n %}
++
++{% block form_id %}changeip_form{% endblock %}
++{% block form_action %}{% url "horizon:project:instances:changeip" instance_id %}{% endblock %}
++
++{% block modal_id %}changeip_modal{% endblock %}
++{% block modal-header %}{% trans "Manage Instance IPs" %}{% endblock %}
++
++{% block modal-body %}
++<div class="left">
++  <fieldset>
++    {% include "horizon/common/_form_fields.html" %}
++  </fieldset>
++</div>
++<div class="right">
++  <h3>{% trans "Description:" %}</h3>
++  <p>{% blocktrans trimmed %}
++    Based on the selected action, the selected IP address can be removed, it can be changed to a new IP
++    address or
++    a new IP address can be added without removing the old one.
++    <br /><br />
++    The new IP address will be added to the selected subnet, if no IP address is provided, a new one will be created
++    automatically.
++    {% endblocktrans %}</p>
++</div>
++{% endblock %}
+\ No newline at end of file
+diff --git a/openstack_dashboard/dashboards/project/instances/templates/instances/changeip.html b/openstack_dashboard/dashboards/project/instances/templates/instances/changeip.html
+new file mode 100644
+index 0000000..15efa19
+--- /dev/null
++++ b/openstack_dashboard/dashboards/project/instances/templates/instances/changeip.html
+@@ -0,0 +1,7 @@
++{% extends "base.html" %}
++{% load i18n %}
++{% block title %}{% trans "Manage Instance IPs" %}{% endblock %}
++
++{% block main %}
++{% include "project/instances/_changeip.html" %}
++{% endblock %}
+\ No newline at end of file
+diff --git a/openstack_dashboard/dashboards/project/instances/urls.py b/openstack_dashboard/dashboards/project/instances/urls.py
+index dd35311..51e9e83 100644
+--- a/openstack_dashboard/dashboards/project/instances/urls.py
++++ b/openstack_dashboard/dashboards/project/instances/urls.py
+@@ -47,6 +47,8 @@ urlpatterns = [
+             views.AttachInterfaceView.as_view(), name='attach_interface'),
+     re_path(INSTANCES % 'detach_interface',
+             views.DetachInterfaceView.as_view(), name='detach_interface'),
++    re_path(INSTANCES % 'changeip',
++            views.ChangeIPView.as_view(), name='changeip'),
+     re_path(r'^(?P<instance_id>[^/]+)/attach_volume/$',
+             views.AttachVolumeView.as_view(),
+             name='attach_volume'),
+diff --git a/openstack_dashboard/dashboards/project/instances/views.py b/openstack_dashboard/dashboards/project/instances/views.py
+index bbd8e28..dc26728 100644
+--- a/openstack_dashboard/dashboards/project/instances/views.py
++++ b/openstack_dashboard/dashboards/project/instances/views.py
+@@ -462,6 +462,22 @@ class DisassociateView(forms.ModalFormView):
+         return {'instance_id': self.kwargs['instance_id']}
+ 
+ 
++class ChangeIPView(forms.ModalFormView):
++    form_class = project_forms.ChangeIPForm
++    template_name = 'project/instances/changeip.html'
++    success_url = reverse_lazy('horizon:project:instances:index')
++    page_title = _("Manage Instance IPs")
++    submit_label = _("Update")
++
++    def get_context_data(self, **kwargs):
++        context = super(ChangeIPView, self).get_context_data(**kwargs)
++        context['instance_id'] = self.kwargs['instance_id']
++        return context
++
++    def get_initial(self):
++        return {'instance_id': self.kwargs['instance_id']}
++
++
+ class DetailView(tabs.TabView):
+     tab_group_class = project_tabs.InstanceDetailTabs
+     template_name = 'horizon/common/_detail.html'
